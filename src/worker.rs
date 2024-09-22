@@ -43,7 +43,7 @@ impl Worker {
         loop {
             let txn = client.transaction().await?;
 
-            if let Some((task_queue, tasks)) = self.pull_tasks(&txn).await? {
+            if let Some((task_queue, tasks)) = self.retrieve_tasks(&txn).await? {
                 tracing::info!(?task_queue, len = tasks.len());
 
                 // Spawn each task
@@ -71,7 +71,7 @@ impl Worker {
                 }
 
                 // Update the queue
-                self.finalize_tasks(&txn, task_queue).await?;
+                task_queue.update_scheduled_for(&txn).await?;
 
                 txn.commit().await?;
 
@@ -82,6 +82,7 @@ impl Worker {
         }
     }
 
+    #[allow(unused)]
     pub async fn create_task(
         txn: &Transaction<'_>,
         scheduled_for: Option<DateTime<Utc>>,
@@ -89,178 +90,51 @@ impl Worker {
         args: Option<serde_json::Value>,
         queue: &str,
     ) -> Result<()> {
-        let scheduled_for = scheduled_for.unwrap_or_else(|| Utc::now());
+        let id = Uuid::new_v4();
+        let scheduled_for = scheduled_for.unwrap_or_else(Utc::now);
         let max_retries = max_retries.unwrap_or(5) as i16;
+        let args = args.unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
 
-        // Insert the job.
-        let stmt = txn
-            .prepare_cached(
-                "
-                    WITH insert_tasks AS (
-                        INSERT INTO tasks (
-                            queue, 
-                            id, 
-                            scheduled_for, 
-                            max_retries, 
-                            args
-                        ) VALUES (
-                            $1, 
-                            $2, 
-                            $3, 
-                            $4, 
-                            $5
-                        )
-                        RETURNING scheduled_for
-                    )
-                    UPDATE task_queues
-                    SET scheduled_for = LEAST(scheduled_for, (SELECT scheduled_for FROM insert_tasks))
-                    WHERE queue = $1
-                ",
-            )
-            .await?;
-
-        txn.execute(
-            &stmt,
-            &[
-                &queue,
-                &Uuid::new_v4(),
-                &scheduled_for,
-                &max_retries,
-                &args.unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
-            ],
-        )
-        .await?;
+        Task::insert(txn, queue, id, scheduled_for, max_retries, args).await?;
 
         Ok(())
     }
 
+    // Retrieve Tasks using a fair scheduler. Each batch of tasks can only belong to at most one queues but
+    // depending on `work_stealing` may either be an exclusive ownership of the queues or return work
+    // from a queues that is already locked by another worker.
+    //
+    // `work_stealing` should mean that if tasks are very imbalanced between queues then the latency will go down
+    // for tasks in that queue however it comes with increased latency on the other queues.
     #[tracing::instrument(level = "trace", skip_all, ret)]
-    pub async fn pull_tasks(
+    pub async fn retrieve_tasks(
         &self,
         txn: &Transaction<'_>,
     ) -> Result<Option<(TaskQueue, Vec<Task>)>> {
         let now = Utc::now();
 
-        // First try to get exclusive access to a single queue.
-        // This is the fairness component.
-        let stmt = txn
-            .prepare_cached(
-                "
-                WITH locked_task_queue AS (
-                    SELECT queue 
-                    FROM task_queues 
-                    WHERE scheduled_for <= $1
-                    ORDER BY scheduled_for 
-                    LIMIT 1 
-                    FOR UPDATE SKIP LOCKED
-                )
-                UPDATE task_queues
-                SET updated_at = $1
-                FROM locked_task_queue
-                WHERE task_queues.queue = locked_task_queue.queue 
-                RETURNING task_queues.*;
-                ",
-            )
-            .await?;
-
-        let task_queue = match txn.query_opt(&stmt, &[&now]).await? {
-            Some(row) => Some(TaskQueue::try_from(row)?),
+        // Try to retrieve an unlocked queue with available work. If there is no unlocked queue with available work
+        // and work stealing is enabled then try to 'steal' work from the queue with the earliest scheduled_for.
+        let task_queue = match TaskQueue::retrieve_next_skip_locked(txn, &now).await? {
+            Some(task_queue) => Some(task_queue),
             None => {
                 if self.work_stealing {
-                    // Otherwise just get the next work available from the queue.
-                    let stmt = txn
-                        .prepare_cached(
-                            "
-                            SELECT task_queues.*
-                            FROM task_queues
-                            WHERE scheduled_for <= $1
-                            ORDER BY scheduled_for
-                            LIMIT 1;
-                            ",
-                        )
-                        .await?;
-
-                    txn.query_opt(&stmt, &[&now])
-                        .await?
-                        .map(TaskQueue::try_from)
-                        .transpose()?
+                    TaskQueue::retrieve_next(txn, &now).await?
                 } else {
                     None
                 }
             }
         };
 
+        // If a queue with workload was found then retrieve available tasks. This should always
+        // return tasks given the scheduled_for check on the task_queue.
         if let Some(task_queue) = task_queue {
-            let stmt = txn
-                .prepare_cached(
-                    "
-                    WITH locked_tasks AS (
-                        SELECT queue, id
-                        FROM tasks 
-                        WHERE queue = $1
-                        AND status = 'QUEUED'::task_status 
-                        AND scheduled_for <= $2
-                        ORDER BY scheduled_for ASC
-                        LIMIT $3
-                        FOR UPDATE SKIP LOCKED
-                    )
-                    UPDATE tasks
-                    SET status = 'RUNNING'::task_status
-                    FROM locked_tasks
-                    WHERE 
-                        tasks.queue = locked_tasks.queue 
-                        AND tasks.id = locked_tasks.id 
-                    RETURNING tasks.*;    
-                    ",
-                )
-                .await?;
+            let tasks =
+                Task::retrieve_tasks(txn, &task_queue.queue, &now, self.concurrency).await?;
 
-            let tasks = txn
-                .query(&stmt, &[&task_queue.queue, &now, &self.concurrency])
-                .instrument(trace_span!("locked_tasks"))
-                .await?
-                .into_iter()
-                .map(|row| Ok(Task::try_from(row)?))
-                .collect::<Result<Vec<_>>>()?;
-
-            if !tasks.is_empty() {
-                return Ok(Some((task_queue, tasks)));
-            }
+            Ok(Some((task_queue, tasks)))
+        } else {
+            Ok(None)
         }
-
-        Ok(None)
-    }
-
-    /// Update the task_queue table to record the next available task `scheduled_for`
-    #[tracing::instrument(level = "trace", skip_all, ret)]
-    pub async fn finalize_tasks(
-        &self,
-        txn: &Transaction<'_>,
-        task_queue: TaskQueue,
-    ) -> Result<TaskQueue> {
-        let stmt = txn
-            .prepare_cached(
-                "
-                UPDATE task_queues 
-                SET 
-                    scheduled_for = (
-                        SELECT MIN(scheduled_for)
-                        FROM tasks
-                        WHERE queue = $1
-                        AND status = 'QUEUED'::task_status
-                    ),
-                    updated_at = $2
-                WHERE queue = $1
-                RETURNING task_queues.*;
-                ",
-            )
-            .await?;
-
-        let task_queue = txn
-            .query_one(&stmt, &[&task_queue.queue, &Utc::now()])
-            .await?
-            .try_into()?;
-
-        Ok(task_queue)
     }
 }

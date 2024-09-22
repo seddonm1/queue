@@ -1,4 +1,5 @@
--- CreateEnum
+CREATE EXTENSION pg_cron;
+
 CREATE TYPE task_status AS ENUM (
     'QUEUED',
     'RUNNING',

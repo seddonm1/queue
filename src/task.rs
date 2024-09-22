@@ -68,6 +68,83 @@ impl Task {
         Ok(())
     }
 
+    pub async fn insert(
+        txn: &Transaction<'_>,
+        queue: &str,
+        id: Uuid,
+        scheduled_for: DateTime<Utc>,
+        max_retries: i16,
+        args: serde_json::Value,
+    ) -> Result<()> {
+        let stmt = txn
+                .prepare_cached(
+                    "
+                    WITH insert_tasks AS (
+                        INSERT INTO tasks (
+                            queue, 
+                            id, 
+                            scheduled_for, 
+                            max_retries, 
+                            args
+                        ) VALUES (
+                            $1, 
+                            $2, 
+                            $3, 
+                            $4, 
+                            $5
+                        )
+                        RETURNING scheduled_for
+                    )
+                    UPDATE task_queues
+                    SET scheduled_for = LEAST(scheduled_for, (SELECT scheduled_for FROM insert_tasks))
+                    WHERE queue = $1
+                    ",
+                )
+                .await?;
+
+        txn.execute(&stmt, &[&queue, &id, &scheduled_for, &max_retries, &args])
+            .await?;
+
+        Ok(())
+    }
+
+    pub async fn retrieve_tasks(
+        txn: &Transaction<'_>,
+        queue: &str,
+        ts: &DateTime<Utc>,
+        concurrency: i64,
+    ) -> Result<Vec<Self>> {
+        let stmt = txn
+            .prepare_cached(
+                "
+                WITH locked_tasks AS (
+                    SELECT queue, id
+                    FROM tasks 
+                    WHERE queue = $1
+                    AND status = 'QUEUED'::task_status 
+                    AND scheduled_for <= $2
+                    ORDER BY scheduled_for ASC
+                    LIMIT $3
+                    FOR UPDATE SKIP LOCKED
+                )
+                UPDATE tasks
+                SET status = 'RUNNING'::task_status
+                FROM locked_tasks
+                WHERE 
+                    tasks.queue = locked_tasks.queue 
+                    AND tasks.id = locked_tasks.id 
+                RETURNING tasks.*;    
+                ",
+            )
+            .await?;
+
+        txn.query(&stmt, &[&queue, ts, &concurrency])
+            .await?
+            .into_iter()
+            .map(|row| Ok(Task::try_from(row)?))
+            .collect::<Result<Vec<_>>>()
+    }
+
     #[tracing::instrument(level = "trace", skip_all, fields(id = ?self.id), ret)]
     pub async fn delete(&self, txn: &Transaction<'_>) -> Result<Self> {
         let stmt = txn

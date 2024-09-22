@@ -83,7 +83,7 @@ pub async fn run() -> Result<()> {
     txn.commit().await?;
 
     let mut set = JoinSet::new();
-    for _ in 0..100 {
+    for _ in 0..10 {
         let cfg = cfg.clone();
         set.spawn(async move {
             Worker::new(
