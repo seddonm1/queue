@@ -7,6 +7,7 @@ use std::time::Duration;
 use tokio_postgres::Row;
 use uuid::Uuid;
 
+/// Enum representing the status of a task.
 #[derive(Clone, Debug, FromSql)]
 #[postgres(name = "task_status", rename_all = "UPPERCASE")]
 pub enum TaskStatus {
@@ -17,57 +18,45 @@ pub enum TaskStatus {
     Cancelled,
 }
 
+/// Struct representing a task in the system.
 #[derive(Clone, Debug)]
 #[allow(unused)]
 pub struct Task {
+    /// The queue this task belongs to.
     pub queue: String,
+    /// Unique identifier for the task.
     pub id: Uuid,
+    /// Timestamp when the task was created.
     pub created_at: DateTime<Utc>,
+    /// Timestamp when the task was last updated.
     pub updated_at: DateTime<Utc>,
+    /// Timestamp when the task is scheduled to run.
     pub scheduled_for: DateTime<Utc>,
+    /// Current status of the task.
     pub status: TaskStatus,
+    /// Arguments associated with the task.
     pub args: serde_json::Value,
+    /// Maximum number of retries allowed for the task.
     pub max_retries: i16,
+    /// Errors encountered during execution of the task.
     pub errors: Vec<TaskError>,
 }
 
+/// Struct representing an error encountered during task execution.
 #[derive(Clone, Debug, Serialize, Deserialize, ToSql, FromSql)]
 pub struct TaskError {
     ts: DateTime<Utc>,
     error: String,
 }
 
-impl TryFrom<Row> for Task {
-    type Error = tokio_postgres::Error;
-
-    fn try_from(value: Row) -> std::result::Result<Self, Self::Error> {
-        let errors = value
-            .try_get::<_, Vec<serde_json::Value>>(8)?
-            .into_iter()
-            .map(|value| Ok(serde_json::from_value(value)?))
-            .collect::<Result<Vec<TaskError>>>()
-            .unwrap();
-
-        Ok(Self {
-            queue: value.try_get(0)?,
-            id: value.try_get(1)?,
-            created_at: value.try_get(2)?,
-            updated_at: value.try_get(3)?,
-            scheduled_for: value.try_get(4)?,
-            status: value.try_get(5)?,
-            args: value.try_get(6)?,
-            max_retries: value.try_get(7)?,
-            errors,
-        })
-    }
-}
-
 impl Task {
+    /// Simulates work being done by the task.
     pub async fn work(&self) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(1)).await;
         Ok(())
     }
 
+    /// Inserts a new task into the database.
     pub async fn insert(
         txn: &Transaction<'_>,
         queue: &str,
@@ -81,16 +70,16 @@ impl Task {
                     "
                     WITH insert_tasks AS (
                         INSERT INTO tasks (
-                            queue, 
-                            id, 
-                            scheduled_for, 
-                            max_retries, 
+                            queue,
+                            id,
+                            scheduled_for,
+                            max_retries,
                             args
                         ) VALUES (
-                            $1, 
-                            $2, 
-                            $3, 
-                            $4, 
+                            $1,
+                            $2,
+                            $3,
+                            $4,
                             $5
                         )
                         RETURNING scheduled_for
@@ -108,6 +97,7 @@ impl Task {
         Ok(())
     }
 
+    /// Retreive a set of Task from the queue and take ownership of them by locking them.
     pub async fn retrieve_tasks(
         txn: &Transaction<'_>,
         queue: &str,
@@ -119,9 +109,9 @@ impl Task {
                 "
                 WITH locked_tasks AS (
                     SELECT queue, id
-                    FROM tasks 
+                    FROM tasks
                     WHERE queue = $1
-                    AND status = 'QUEUED'::task_status 
+                    AND status = 'QUEUED'::task_status
                     AND scheduled_for <= $2
                     ORDER BY scheduled_for ASC
                     LIMIT $3
@@ -130,10 +120,10 @@ impl Task {
                 UPDATE tasks
                 SET status = 'RUNNING'::task_status
                 FROM locked_tasks
-                WHERE 
-                    tasks.queue = locked_tasks.queue 
-                    AND tasks.id = locked_tasks.id 
-                RETURNING tasks.*;    
+                WHERE
+                    tasks.queue = locked_tasks.queue
+                    AND tasks.id = locked_tasks.id
+                RETURNING tasks.*;
                 ",
             )
             .await?;
@@ -145,13 +135,14 @@ impl Task {
             .collect::<Result<Vec<_>>>()
     }
 
+    /// Deletes the task from the database.
     #[tracing::instrument(level = "trace", skip_all, fields(id = ?self.id), ret)]
     pub async fn delete(&self, txn: &Transaction<'_>) -> Result<Self> {
         let stmt = txn
             .prepare_cached(
                 "
-                UPDATE tasks 
-                SET 
+                UPDATE tasks
+                SET
                     status = 'SUCCEEDED'::task_status,
                     updated_at = $3
                 WHERE queue = $1 AND id = $2
@@ -166,23 +157,24 @@ impl Task {
         )?)
     }
 
-    /// https://worker.graphile.org/docs/exponential-backoff
+    /// Updates the task with and Error. Using the max_retries field the status can be calculated as
+    /// 'Queued' or 'Failed' and a new scheduled_for time can be calculated using [expontential-backoff](https://worker.graphile.org/docs/exponential-backoff).
     #[tracing::instrument(level = "trace", skip_all, fields(id = ?self.id), ret)]
     pub async fn fail(&self, txn: &Transaction<'_>, error: anyhow::Error) -> Result<Self> {
         let stmt = txn
             .prepare_cached(
                 "
-                UPDATE tasks 
-                SET 
+                UPDATE tasks
+                SET
                     updated_at = $3,
                     errors = ARRAY_APPEND(errors, $4),
-                    status = CASE 
+                    status = CASE
                         WHEN CARDINALITY(errors) = max_retries - 1 THEN 'FAILED'::task_status
                         ELSE 'QUEUED'::task_status
                     END,
-                    scheduled_for = CASE 
-                        WHEN CARDINALITY(errors) = max_retries - 1 THEN scheduled_for 
-                        ELSE scheduled_for + EXP(LEAST(10, CARDINALITY(errors))) * INTERVAL '1 second' 
+                    scheduled_for = CASE
+                        WHEN CARDINALITY(errors) = max_retries - 1 THEN scheduled_for
+                        ELSE scheduled_for + EXP(LEAST(10, CARDINALITY(errors))) * INTERVAL '1 second'
                     END
                 WHERE queue = $1 AND id = $2
                 RETURNING tasks.*;
@@ -208,5 +200,31 @@ impl Task {
             )
             .await?,
         )?)
+    }
+}
+
+impl TryFrom<Row> for Task {
+    type Error = tokio_postgres::Error;
+
+    /// Converts a database row into a `Task` instance.
+    fn try_from(value: Row) -> std::result::Result<Self, Self::Error> {
+        let errors = value
+            .try_get::<_, Vec<serde_json::Value>>(8)?
+            .into_iter()
+            .map(|value| Ok(serde_json::from_value(value)?))
+            .collect::<Result<Vec<TaskError>>>()
+            .unwrap();
+
+        Ok(Self {
+            queue: value.try_get(0)?,
+            id: value.try_get(1)?,
+            created_at: value.try_get(2)?,
+            updated_at: value.try_get(3)?,
+            scheduled_for: value.try_get(4)?,
+            status: value.try_get(5)?,
+            args: value.try_get(6)?,
+            max_retries: value.try_get(7)?,
+            errors,
+        })
     }
 }

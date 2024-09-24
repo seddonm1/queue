@@ -16,19 +16,19 @@ impl TaskQueue {
             .prepare_cached(
                 "
                 INSERT INTO task_queues (
-                    queue, 
-                    scheduled_for, 
+                    queue,
+                    scheduled_for,
                     updated_at
                 ) VALUES (
-                    $1, 
-                    $2, 
+                    $1,
+                    $2,
                     $3
-                ) 
+                )
                 ON CONFLICT (
                     queue
-                ) 
-                DO UPDATE SET 
-                    scheduled_for = EXCLUDED.scheduled_for, 
+                )
+                DO UPDATE SET
+                    scheduled_for = EXCLUDED.scheduled_for,
                     updated_at = EXCLUDED.updated_at;
                 ",
             )
@@ -40,7 +40,7 @@ impl TaskQueue {
         Ok(())
     }
 
-    /// Retrieve the next task_queue that has available_work skipping locked records.
+    /// Retrieve the next task_queue that has available work respecting locked rows.
     pub async fn retrieve_next_skip_locked(
         txn: &Transaction<'_>,
         ts: &DateTime<Utc>,
@@ -49,17 +49,17 @@ impl TaskQueue {
             .prepare_cached(
                 "
                 WITH locked_task_queue AS (
-                    SELECT queue 
-                    FROM task_queues 
+                    SELECT queue
+                    FROM task_queues
                     WHERE scheduled_for <= $1
-                    ORDER BY scheduled_for 
-                    LIMIT 1 
+                    ORDER BY scheduled_for
+                    LIMIT 1
                     FOR UPDATE SKIP LOCKED
                 )
                 UPDATE task_queues
                 SET updated_at = $1
                 FROM locked_task_queue
-                WHERE task_queues.queue = locked_task_queue.queue 
+                WHERE task_queues.queue = locked_task_queue.queue
                 RETURNING task_queues.*;
                 ",
             )
@@ -73,7 +73,10 @@ impl TaskQueue {
     }
 
     /// Retrieve the next task_queue that has available_work ignoring any locking.
-    pub async fn retrieve_next(txn: &Transaction<'_>, ts: &DateTime<Utc>) -> Result<Option<Self>> {
+    pub async fn retrieve_next_ignore_locks(
+        txn: &Transaction<'_>,
+        ts: &DateTime<Utc>,
+    ) -> Result<Option<Self>> {
         let stmt = txn
             .prepare_cached(
                 "
@@ -98,8 +101,8 @@ impl TaskQueue {
         let stmt = txn
             .prepare_cached(
                 "
-                UPDATE task_queues 
-                SET 
+                UPDATE task_queues
+                SET
                     scheduled_for = (
                         SELECT MIN(scheduled_for)
                         FROM tasks
@@ -125,6 +128,7 @@ impl TaskQueue {
 impl TryFrom<Row> for TaskQueue {
     type Error = tokio_postgres::Error;
 
+    /// Converts a database row into a `TaskQueue` instance.
     fn try_from(value: Row) -> std::result::Result<Self, Self::Error> {
         Ok(Self {
             queue: value.try_get(0)?,
