@@ -1,7 +1,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use deadpool_postgres::{Config, Pool, Runtime, Transaction};
-use futures::stream::FuturesUnordered;
+use futures::{future::BoxFuture, stream::FuturesUnordered};
 use std::time::Duration;
 use tokio::time::sleep;
 use tokio_postgres::NoTls;
@@ -22,6 +22,7 @@ pub struct Worker {
     work_stealing: bool,
     /// Maximum number of tasks the worker can process concurrently.
     concurrency: i64,
+    f: fn(Task) -> BoxFuture<'static, Result<()>>,
 }
 
 impl Worker {
@@ -40,6 +41,8 @@ impl Worker {
         sleep_duration: Option<Duration>,
         work_stealing: Option<bool>,
         concurrency: Option<u16>,
+
+        f: fn(Task) -> BoxFuture<'static, Result<()>>,
     ) -> Self {
         let pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls).unwrap();
         pool.resize(1);
@@ -50,6 +53,7 @@ impl Worker {
             sleep_duration: sleep_duration.unwrap_or(Duration::from_millis(250)),
             work_stealing: work_stealing.unwrap_or(true),
             concurrency: concurrency.unwrap_or(10) as i64,
+            f,
         }
     }
 
@@ -97,11 +101,14 @@ impl Worker {
                     let tasks_set = tasks
                         .into_iter()
                         .map(|task| {
-                            let task_move = task.clone();
+                            let task_id = task.id;
+                            let task_clone = task.clone();
                             (
-                                task.clone(),
-                                tokio::spawn(async move { task_move.work().await })
-                                    .instrument(trace_span!("task", id = ?task.id)),
+                                task,
+                                tokio::spawn(
+                                    { (self.f)(task_clone) }
+                                        .instrument(trace_span!("task", id = ?task_id)),
+                                ),
                             )
                         })
                         .collect::<FuturesUnordered<_>>();

@@ -5,9 +5,11 @@ mod worker;
 use anyhow::Result;
 use chrono::Utc;
 use deadpool_postgres::{Config, ManagerConfig, RecyclingMethod, Runtime};
+use futures::future::BoxFuture;
 use rand::Rng;
 use rand_distr::Normal;
 use std::{ops::DerefMut, time::Duration};
+use task::Task;
 use task_queue::TaskQueue;
 // use testcontainers::{
 //     core::{ContainerPort, WaitFor},
@@ -91,6 +93,7 @@ pub async fn run() -> Result<()> {
                 Some(Duration::from_millis(100)),
                 Some(true),
                 Some(100),
+                work,
             )
             .run()
             .await
@@ -101,5 +104,15 @@ pub async fn run() -> Result<()> {
         println!("{:?}", res);
     }
 
+    Ok(())
+}
+
+pub fn work(task: Task) -> BoxFuture<'static, Result<()>> {
+    Box::pin(a(task))
+}
+
+pub async fn a(task: Task) -> Result<()> {
+    println!("{:?}", task);
+    tokio::time::sleep(Duration::from_millis(1)).await;
     Ok(())
 }
