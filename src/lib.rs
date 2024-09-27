@@ -5,7 +5,6 @@ mod worker;
 use anyhow::Result;
 use chrono::Utc;
 use deadpool_postgres::{Config, ManagerConfig, RecyclingMethod, Runtime};
-use futures::future::BoxFuture;
 use rand::Rng;
 use rand_distr::Normal;
 use std::{ops::DerefMut, time::Duration};
@@ -93,7 +92,7 @@ pub async fn run() -> Result<()> {
                 Some(Duration::from_millis(100)),
                 Some(true),
                 Some(100),
-                work,
+                |task: Task| Box::pin(a(task)),
             )
             .run()
             .await
@@ -105,10 +104,6 @@ pub async fn run() -> Result<()> {
     }
 
     Ok(())
-}
-
-pub fn work(task: Task) -> BoxFuture<'static, Result<()>> {
-    Box::pin(a(task))
 }
 
 pub async fn a(task: Task) -> Result<()> {
