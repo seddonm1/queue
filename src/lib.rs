@@ -4,18 +4,20 @@ mod worker;
 
 use anyhow::Result;
 use chrono::Utc;
-use deadpool_postgres::{Config, ManagerConfig, RecyclingMethod, Runtime};
+use deadpool_postgres::{Config, ManagerConfig, Pool, RecyclingMethod, Runtime};
 use rand::Rng;
 use rand_distr::Normal;
 use std::{ops::DerefMut, time::Duration};
 use task::Task;
 use task_queue::TaskQueue;
+use tracing::{info_span, Instrument};
+use uuid::Uuid;
 // use testcontainers::{
 //     core::{ContainerPort, WaitFor},
 //     runners::AsyncRunner,
 //     GenericImage, ImageExt,
 // };
-use tokio::task::JoinSet;
+use tokio::{task::JoinSet, time};
 use tokio_postgres::NoTls;
 use worker::Worker;
 
@@ -68,35 +70,24 @@ pub async fn run() -> Result<()> {
         .await?;
     }
     for _ in 0i32..10_000 {
-        Worker::create_task(
+        Task::insert(
             &txn,
-            Some(
-                Utc::now()
-                    + Duration::from_millis(10000)
-                    + Duration::from_millis(rand::thread_rng().gen_range(0..10000)),
-            ),
-            None,
-            None,
             &format!("queue_{}", rand::thread_rng().sample(normal) as u32),
+            Uuid::new_v4(),
+            Utc::now()
+                + Duration::from_millis(30000)
+                + Duration::from_millis(rand::thread_rng().gen_range(0..10000)),
+            5,
+            serde_json::Value::Object(serde_json::Map::new()),
         )
         .await?;
     }
     txn.commit().await?;
 
     let mut set = JoinSet::new();
-    for _ in 0..10 {
+    for _ in 0..200 {
         let cfg = cfg.clone();
-        set.spawn(async move {
-            Worker::new(
-                &cfg,
-                Some(Duration::from_millis(100)),
-                Some(true),
-                Some(100),
-                |task: Task| Box::pin(a(task)),
-            )
-            .run()
-            .await
-        });
+        set.spawn(async move { ExampleWorker::new(&cfg).run().await });
     }
 
     while let Some(res) = set.join_next().await {
@@ -106,8 +97,48 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
-pub async fn a(task: Task) -> Result<()> {
-    println!("{:?}", task);
-    tokio::time::sleep(Duration::from_millis(1)).await;
-    Ok(())
+/// A worker in the task queue system that processes tasks.
+pub struct ExampleWorker {
+    /// Unique identifier for the worker.
+    id: Uuid,
+    /// Connection pool to interact with the database.
+    pool: Pool,
+}
+
+impl ExampleWorker {
+    /// Creates a new `ExampleWorker`.
+    pub fn new(cfg: &Config) -> Self {
+        let pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls).unwrap();
+
+        Self {
+            id: Uuid::new_v4(),
+            pool,
+        }
+    }
+}
+
+impl Worker for ExampleWorker {
+    /// Unique identifier for the worker.
+    fn id(&self) -> Uuid {
+        self.id
+    }
+
+    /// Connection pool to interact with the database.
+    fn pool(&self) -> &Pool {
+        &self.pool
+    }
+
+    /// A function to do the work.
+    #[allow(unused)]
+    fn work(
+        task: Task,
+        pool: Pool,
+    ) -> impl std::future::Future<Output = Result<()>> + std::marker::Send + 'static {
+        let task_id = task.id;
+        async move {
+            time::sleep(Duration::from_millis(10)).await;
+            Ok(())
+        }
+        .instrument(info_span!("task", id = ?task_id))
+    }
 }

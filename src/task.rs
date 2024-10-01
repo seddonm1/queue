@@ -3,7 +3,6 @@ use chrono::{DateTime, Utc};
 use deadpool_postgres::Transaction;
 use postgres_types::{FromSql, ToSql};
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 use tokio_postgres::Row;
 use uuid::Uuid;
 
@@ -50,12 +49,6 @@ pub struct TaskError {
 }
 
 impl Task {
-    /// Simulates work being done by the task.
-    pub async fn work(&self) -> Result<()> {
-        tokio::time::sleep(Duration::from_millis(1)).await;
-        Ok(())
-    }
-
     /// Inserts a new task into the database.
     pub async fn insert(
         txn: &Transaction<'_>,
@@ -137,7 +130,7 @@ impl Task {
 
     /// Deletes the task from the database.
     #[tracing::instrument(level = "trace", skip_all, fields(id = ?self.id), ret)]
-    pub async fn delete(&self, txn: &Transaction<'_>) -> Result<Self> {
+    pub async fn success(&self, txn: &Transaction<'_>) -> Result<Self> {
         let stmt = txn
             .prepare_cached(
                 "
@@ -160,7 +153,7 @@ impl Task {
     /// Updates the task with and Error. Using the max_retries field the status can be calculated as
     /// 'Queued' or 'Failed' and a new scheduled_for time can be calculated using [expontential-backoff](https://worker.graphile.org/docs/exponential-backoff).
     #[tracing::instrument(level = "trace", skip_all, fields(id = ?self.id), ret)]
-    pub async fn fail(&self, txn: &Transaction<'_>, error: anyhow::Error) -> Result<Self> {
+    pub async fn failure(&self, txn: &Transaction<'_>, error: anyhow::Error) -> Result<Self> {
         let stmt = txn
             .prepare_cached(
                 "

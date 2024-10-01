@@ -1,7 +1,7 @@
 services:
   postgres:
     build: "."
-    image: postgres-pgcron:16.4
+    image: postgres-pgcron:17.0
     ports:
       - 5432:5432
     tmpfs:
@@ -10,3 +10,4 @@ services:
       - POSTGRES_PASSWORD=postgres
       - POSTGRES_USER=postgres
       - POSTGRES_DB=postgres
+    command: -c 'max_connections=500'
